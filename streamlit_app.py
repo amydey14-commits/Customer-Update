@@ -1,14 +1,14 @@
 # streamlit_app.py
-# One-input Streamlit app → generates a left-rail PPTX slide from customer name.
-# Absolutely no subprocess/pip at runtime. Safe for restricted environments.
+# One-input Streamlit app → generates a left-rail PPTX slide from the customer name.
+# No runtime pip/subprocess. Supports OpenAI/Anthropic (optional) or No-LLM presets.
 
 import io
-from datetime import datetime
 import json
+from datetime import datetime
 
 import streamlit as st
 
-# --- import python-pptx and (optionally) requests without subprocess ---
+# ---- Required deps (no runtime install) ----
 try:
     from pptx import Presentation
     from pptx.util import Inches, Pt
@@ -18,14 +18,15 @@ try:
 except ImportError:
     st.error(
         "Missing dependency: **python-pptx**.\n\n"
-        "Please add `python-pptx` to your environment (e.g., requirements.txt) and rerun the app."
+        "Add `python-pptx` to requirements.txt, redeploy, and rerun the app."
     )
     st.stop()
 
+# Optional (for calling OpenAI/Anthropic). App still works without it in No-LLM mode.
 try:
-    import requests  # optional; only needed for OpenAI/Anthropic
+    import requests
 except ImportError:
-    requests = None  # We'll disable LLM modes if requests isn't available.
+    requests = None
 
 # ---------------------------- UI ----------------------------
 st.set_page_config(page_title="Customer Update Slide Generator", page_icon="📊", layout="centered")
@@ -37,7 +38,7 @@ with st.expander("What this does", expanded=False):
         - Enter a **customer name** (e.g., *Rugs USA*).  
         - Choose **OpenAI**, **Anthropic**, or **No-LLM** (presets/smart defaults).  
         - Click **Generate PPTX** to download your left-rail slide.  
-        - This build has **no runtime installs** or subprocess calls.
+        - No runtime installs; dependencies come from requirements.txt.
         """
     )
 
@@ -140,7 +141,7 @@ def safe_parse_json(text: str):
             continue
     raise ValueError("Could not parse JSON from model output.")
 
-# Preset for No-LLM mode
+# Preset(s) for No-LLM mode (you can add more customers here)
 PRESETS = {
     "Rugs USA": {
         "corporate_vision":
@@ -179,6 +180,7 @@ PRESETS = {
 }
 
 def generate_sections(customer_name: str, mode: str, key: str):
+    # No-LLM preset / generic template
     if mode == "No-LLM (preset/smart template)":
         if customer_name in PRESETS:
             return PRESETS[customer_name]
@@ -217,6 +219,7 @@ def generate_sections(customer_name: str, mode: str, key: str):
             ],
         }
 
+    # OpenAI
     if mode == "OpenAI":
         if not requests:
             raise RuntimeError("`requests` package not available.")
@@ -225,6 +228,7 @@ def generate_sections(customer_name: str, mode: str, key: str):
         text = call_openai_chat(key, USER_PROMPT_TMPL.format(customer=customer_name))
         return safe_parse_json(text)
 
+    # Anthropic
     if mode == "Anthropic":
         if not requests:
             raise RuntimeError("`requests` package not available.")
@@ -324,7 +328,9 @@ def build_slide(customer_name: str, accent_rgb, sections: dict, logo_bytes=None)
 # ---------------------------- Generate ----------------------------
 if st.button("Generate PPTX"):
     try:
+        # Build content
         sections = generate_sections(customer.strip(), provider, api_key.strip())
+        # Render pptx
         prs = build_slide(customer.strip(), rgb_hex_to_tuple(accent_hex), sections, logo_file)
         buf = io.BytesIO()
         prs.save(buf); buf.seek(0)
@@ -338,7 +344,4 @@ if st.button("Generate PPTX"):
     except Exception as e:
         st.error(f"Generation failed: {e}")
 
-st.caption(
-    "If you see a 'Missing dependency' message above, add the package(s) to requirements.txt "
-    "or your environment, then reload the app."
-)
+st.caption("Use **No-LLM** for presets, or add an API key in the UI for tailored content.")
