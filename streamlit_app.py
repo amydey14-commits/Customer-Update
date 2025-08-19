@@ -1,26 +1,37 @@
 # streamlit_app.py
-# One-input Streamlit app: enter Customer Name → (LLM or preset) → render left-rail slide → download PPTX
-# Runs fully inside Streamlit: installs dependencies if missing, accepts API keys in the UI.
+# One-input Streamlit app → generates a left-rail PPTX slide from the customer name.
+# No runtime pip installs. Uses requests + python-pptx. Pillow not required.
 
-import sys, subprocess, importlib, io, json, os
+import io
+import json
 from datetime import datetime
 
-def _ensure(pkg: str):
-    """Install a package at runtime if it isn't available."""
-    if importlib.util.find_spec(pkg) is None:
-        subprocess.check_call([sys.executable, "-m", "pip", "install", pkg], stdout=subprocess.DEVNULL)
-
-# Ensure dependencies (silently)
-for _p in ["streamlit", "python-pptx", "Pillow", "requests"]:
-    _ensure(_p)
-
-import requests
 import streamlit as st
-from pptx import Presentation
-from pptx.util import Inches, Pt
-from pptx.dml.color import RGBColor
-from pptx.enum.text import PP_ALIGN
-from pptx.enum.shapes import MSO_SHAPE
+
+# --- graceful imports & checks (no pip installs here) ---
+_missing = []
+try:
+    import requests
+except Exception:
+    _missing.append("requests")
+
+try:
+    from pptx import Presentation
+    from pptx.util import Inches, Pt
+    from pptx.dml.color import RGBColor
+    from pptx.enum.text import PP_ALIGN
+    from pptx.enum.shapes import MSO_SHAPE
+except Exception:
+    _missing.append("python-pptx")
+
+if _missing:
+    st.error(
+        "This app needs the following Python packages installed on the server: "
+        + ", ".join(_missing)
+        + ".\n\n"
+          "If you’re on Streamlit Cloud, add them to `requirements.txt`."
+    )
+    st.stop()
 
 # ---------------------------- UI ----------------------------
 st.set_page_config(page_title="Customer Update Slide Generator", page_icon="📊", layout="centered")
@@ -30,13 +41,12 @@ with st.expander("What this does", expanded=False):
     st.markdown(
         """
         - Enter a **customer name** (e.g., *Rugs USA*).  
-        - Choose **OpenAI**, **Anthropic**, or **No-LLM** (uses smart defaults & presets).  
+        - Choose **OpenAI**, **Anthropic**, or **No-LLM** (uses presets / smart defaults).  
         - Click **Generate PPTX** → download your left-rail slide.
-        - Everything runs **inside this app** (packages auto-install if needed).
+        - This version avoids any runtime package installs (no subprocess/pip).
         """
     )
 
-# Inputs
 customer = st.text_input("Customer name", "Rugs USA")
 colA, colB = st.columns([1,1])
 with colA:
@@ -80,7 +90,6 @@ def _rgb_hex_to_tuple(hex_color: str):
     return tuple(int(h[i:i+2], 16) for i in (0, 2, 4))
 
 def _post_openai_chat(key: str, prompt: str):
-    """Call OpenAI Chat Completions via HTTP (no SDK required)."""
     url = "https://api.openai.com/v1/chat/completions"
     headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
     data = {
@@ -97,7 +106,6 @@ def _post_openai_chat(key: str, prompt: str):
     return r.json()["choices"][0]["message"]["content"]
 
 def _post_anthropic(key: str, prompt: str):
-    """Call Anthropic Messages API via HTTP (no SDK required)."""
     url = "https://api.anthropic.com/v1/messages"
     headers = {
         "x-api-key": key,
@@ -113,13 +121,10 @@ def _post_anthropic(key: str, prompt: str):
     }
     r = requests.post(url, headers=headers, json=data, timeout=60)
     r.raise_for_status()
-    # Anthropic returns list of content blocks
     blocks = r.json().get("content", [])
-    text = "".join(b.get("text", "") for b in blocks if b.get("type") == "text")
-    return text
+    return "".join(b.get("text", "") for b in blocks if b.get("type") == "text")
 
 def _safe_parse_json(text: str):
-    """Robust JSON extraction from model output."""
     try:
         return json.loads(text)
     except Exception:
@@ -133,7 +138,7 @@ def _safe_parse_json(text: str):
             continue
     raise ValueError("Could not parse JSON from model output.")
 
-# Built-in presets for No-LLM mode (Rugs USA included)
+# Built-in preset for No-LLM mode (Rugs USA)
 PRESETS = {
     "Rugs USA": {
         "corporate_vision":
@@ -172,12 +177,10 @@ PRESETS = {
 }
 
 def generate_sections(customer_name: str, mode: str, key: str):
-    """Return dict with the 5 sections."""
-    # 1) No-LLM: preset or smart generic template
     if mode.startswith("No-LLM"):
         if customer_name in PRESETS:
             return PRESETS[customer_name]
-        # Generic retail/e-com template if no preset
+        # generic fallback
         return {
             "corporate_vision":
                 f"{customer_name} delivers curated, great-value products through a digital-first, "
@@ -211,21 +214,16 @@ def generate_sections(customer_name: str, mode: str, key: str):
                 "Contingency playbooks and DR testing.",
             ],
         }
-
-    # 2) OpenAI
     if mode == "OpenAI":
-        if not key:
+        if not api_key:
             raise RuntimeError("Missing OpenAI API key.")
-        text = _post_openai_chat(key, USER_PROMPT_TMPL.format(customer=customer_name))
+        text = _post_openai_chat(api_key, USER_PROMPT_TMPL.format(customer=customer_name))
         return _safe_parse_json(text)
-
-    # 3) Anthropic
     if mode == "Anthropic":
-        if not key:
+        if not api_key:
             raise RuntimeError("Missing Anthropic API key.")
-        text = _post_anthropic(key, USER_PROMPT_TMPL.format(customer=customer_name))
+        text = _post_anthropic(api_key, USER_PROMPT_TMPL.format(customer=customer_name))
         return _safe_parse_json(text)
-
     raise RuntimeError("Unknown provider.")
 
 # ---------------------------- PPTX rendering ----------------------------
@@ -248,12 +246,11 @@ def _left_label(slide, text, y_in):
     p.font.color.rgb = RGBColor(0,0,0)
 
 def _right_title_body(slide, title, body, y_in):
-    # Title
     tbox = slide.shapes.add_textbox(Inches(3.0), Inches(y_in), Inches(9.6), Inches(0.7))
     tf = tbox.text_frame; tf.clear()
     p = tf.paragraphs[0]; p.text = title
     p.font.size = Pt(22); p.font.bold = True
-    # Body (handles paragraph or list)
+
     bbox = slide.shapes.add_textbox(Inches(3.0), Inches(y_in+0.55), Inches(9.6), Inches(1.4))
     btf = bbox.text_frame; btf.clear()
     if isinstance(body, str):
@@ -318,11 +315,9 @@ if st.button("Generate PPTX"):
     try:
         accent_rgb = _rgb_hex_to_tuple(accent)
         sections = generate_sections(customer.strip(), provider, api_key.strip())
-
         prs = build_slide(customer.strip(), accent_rgb, sections, logo)
         buf = io.BytesIO()
         prs.save(buf); buf.seek(0)
-
         st.success("PPTX generated successfully!")
         st.download_button(
             "⬇️ Download PPTX",
@@ -333,4 +328,4 @@ if st.button("Generate PPTX"):
     except Exception as e:
         st.error(f"Generation failed: {e}")
 
-st.caption("Tip: Use OpenAI/Anthropic with a key for tailored content, or try No-LLM for fast presets.")
+st.caption("Tip: If you see a 'missing packages' error, add those names to requirements.txt in your app workspace.")
