@@ -1,37 +1,31 @@
 # streamlit_app.py
-# One-input Streamlit app → generates a left-rail PPTX slide from the customer name.
-# No runtime pip installs. Uses requests + python-pptx. Pillow not required.
+# One-input Streamlit app → generates a left-rail PPTX slide from customer name.
+# Absolutely no subprocess/pip at runtime. Safe for restricted environments.
 
 import io
-import json
 from datetime import datetime
+import json
 
 import streamlit as st
 
-# --- graceful imports & checks (no pip installs here) ---
-_missing = []
-try:
-    import requests
-except Exception:
-    _missing.append("requests")
-
+# --- import python-pptx and (optionally) requests without subprocess ---
 try:
     from pptx import Presentation
     from pptx.util import Inches, Pt
     from pptx.dml.color import RGBColor
     from pptx.enum.text import PP_ALIGN
     from pptx.enum.shapes import MSO_SHAPE
-except Exception:
-    _missing.append("python-pptx")
-
-if _missing:
+except ImportError:
     st.error(
-        "This app needs the following Python packages installed on the server: "
-        + ", ".join(_missing)
-        + ".\n\n"
-          "If you’re on Streamlit Cloud, add them to `requirements.txt`."
+        "Missing dependency: **python-pptx**.\n\n"
+        "Please add `python-pptx` to your environment (e.g., requirements.txt) and rerun the app."
     )
     st.stop()
+
+try:
+    import requests  # optional; only needed for OpenAI/Anthropic
+except ImportError:
+    requests = None  # We'll disable LLM modes if requests isn't available.
 
 # ---------------------------- UI ----------------------------
 st.set_page_config(page_title="Customer Update Slide Generator", page_icon="📊", layout="centered")
@@ -41,23 +35,27 @@ with st.expander("What this does", expanded=False):
     st.markdown(
         """
         - Enter a **customer name** (e.g., *Rugs USA*).  
-        - Choose **OpenAI**, **Anthropic**, or **No-LLM** (uses presets / smart defaults).  
-        - Click **Generate PPTX** → download your left-rail slide.
-        - This version avoids any runtime package installs (no subprocess/pip).
+        - Choose **OpenAI**, **Anthropic**, or **No-LLM** (presets/smart defaults).  
+        - Click **Generate PPTX** to download your left-rail slide.  
+        - This build has **no runtime installs** or subprocess calls.
         """
     )
 
 customer = st.text_input("Customer name", "Rugs USA")
-colA, colB = st.columns([1,1])
-with colA:
-    accent = st.color_picker("Accent color", value="#08574A")
-with colB:
-    logo = st.file_uploader("Optional: Upload customer logo (PNG)", type=["png"])
+c1, c2 = st.columns(2)
+with c1:
+    accent_hex = st.color_picker("Accent color", value="#08574A")
+with c2:
+    logo_file = st.file_uploader("Optional: Upload customer logo (PNG)", type=["png"])
 
-provider = st.selectbox("Generator", ["OpenAI", "Anthropic", "No-LLM (preset/smart template)"])
+provider_options = ["No-LLM (preset/smart template)"]
+if requests is not None:
+    provider_options = ["OpenAI", "Anthropic"] + provider_options
+provider = st.selectbox("Generator", provider_options)
+
 api_key = ""
 if provider in ("OpenAI", "Anthropic"):
-    api_key = st.text_input(f"{provider} API key", type="password", placeholder="Paste key here (kept in session only)")
+    api_key = st.text_input(f"{provider} API key", type="password", placeholder="Paste key here")
 
 st.divider()
 
@@ -85,11 +83,13 @@ Rules:
 - Do not include sources or URLs. Return only JSON.
 """
 
-def _rgb_hex_to_tuple(hex_color: str):
+def rgb_hex_to_tuple(hex_color: str):
     h = hex_color.lstrip("#")
     return tuple(int(h[i:i+2], 16) for i in (0, 2, 4))
 
-def _post_openai_chat(key: str, prompt: str):
+def call_openai_chat(key: str, prompt: str) -> str:
+    if requests is None:
+        raise RuntimeError("The 'requests' package is required for OpenAI mode.")
     url = "https://api.openai.com/v1/chat/completions"
     headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
     data = {
@@ -105,7 +105,9 @@ def _post_openai_chat(key: str, prompt: str):
     r.raise_for_status()
     return r.json()["choices"][0]["message"]["content"]
 
-def _post_anthropic(key: str, prompt: str):
+def call_anthropic(key: str, prompt: str) -> str:
+    if requests is None:
+        raise RuntimeError("The 'requests' package is required for Anthropic mode.")
     url = "https://api.anthropic.com/v1/messages"
     headers = {
         "x-api-key": key,
@@ -124,7 +126,7 @@ def _post_anthropic(key: str, prompt: str):
     blocks = r.json().get("content", [])
     return "".join(b.get("text", "") for b in blocks if b.get("type") == "text")
 
-def _safe_parse_json(text: str):
+def safe_parse_json(text: str):
     try:
         return json.loads(text)
     except Exception:
@@ -138,7 +140,7 @@ def _safe_parse_json(text: str):
             continue
     raise ValueError("Could not parse JSON from model output.")
 
-# Built-in preset for No-LLM mode (Rugs USA)
+# Preset for No-LLM mode
 PRESETS = {
     "Rugs USA": {
         "corporate_vision":
@@ -177,10 +179,10 @@ PRESETS = {
 }
 
 def generate_sections(customer_name: str, mode: str, key: str):
-    if mode.startswith("No-LLM"):
+    if mode == "No-LLM (preset/smart template)":
         if customer_name in PRESETS:
             return PRESETS[customer_name]
-        # generic fallback
+        # generic fallback for unknown brands
         return {
             "corporate_vision":
                 f"{customer_name} delivers curated, great-value products through a digital-first, "
@@ -214,38 +216,48 @@ def generate_sections(customer_name: str, mode: str, key: str):
                 "Contingency playbooks and DR testing.",
             ],
         }
+
     if mode == "OpenAI":
-        if not api_key:
+        if not requests:
+            raise RuntimeError("`requests` package not available.")
+        if not key:
             raise RuntimeError("Missing OpenAI API key.")
-        text = _post_openai_chat(api_key, USER_PROMPT_TMPL.format(customer=customer_name))
-        return _safe_parse_json(text)
+        text = call_openai_chat(key, USER_PROMPT_TMPL.format(customer=customer_name))
+        return safe_parse_json(text)
+
     if mode == "Anthropic":
-        if not api_key:
+        if not requests:
+            raise RuntimeError("`requests` package not available.")
+        if not key:
             raise RuntimeError("Missing Anthropic API key.")
-        text = _post_anthropic(api_key, USER_PROMPT_TMPL.format(customer=customer_name))
-        return _safe_parse_json(text)
+        text = call_anthropic(key, USER_PROMPT_TMPL.format(customer=customer_name))
+        return safe_parse_json(text)
+
     raise RuntimeError("Unknown provider.")
 
 # ---------------------------- PPTX rendering ----------------------------
-def _add_logo(slide, file_or_bytes, width_in=1.6):
+def add_logo(slide, file_uploader_obj, width_in=1.6):
     try:
-        slide.shapes.add_picture(file_or_bytes, Inches(11.4), Inches(0.3), width=Inches(width_in))
+        if file_uploader_obj is None:
+            return
+        data = file_uploader_obj.getvalue()
+        slide.shapes.add_picture(io.BytesIO(data), Inches(11.4), Inches(0.3), width=Inches(width_in))
     except Exception:
         pass
 
-def _add_rule(slide, y_in, color, thickness=2.2):
+def add_rule(slide, y_in, color, thickness=2.2):
     shp = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(0.5), Inches(y_in), Inches(12.3), Inches(0.02*thickness))
     shp.fill.solid(); shp.fill.fore_color.rgb = color
     shp.line.fill.background()
 
-def _left_label(slide, text, y_in):
+def left_label(slide, text, y_in):
     box = slide.shapes.add_textbox(Inches(0.3), Inches(y_in), Inches(2.5), Inches(1.0))
     tf = box.text_frame; tf.clear()
     p = tf.paragraphs[0]; p.text = text
     p.font.size = Pt(24); p.font.bold = True
     p.font.color.rgb = RGBColor(0,0,0)
 
-def _right_title_body(slide, title, body, y_in):
+def right_title_body(slide, title, body, y_in):
     tbox = slide.shapes.add_textbox(Inches(3.0), Inches(y_in), Inches(9.6), Inches(0.7))
     tf = tbox.text_frame; tf.clear()
     p = tf.paragraphs[0]; p.text = title
@@ -275,8 +287,7 @@ def build_slide(customer_name: str, accent_rgb, sections: dict, logo_bytes=None)
     p.font.size = Pt(44); p.font.bold = True
 
     # Logo
-    if logo_bytes:
-        _add_logo(slide, logo_bytes)
+    add_logo(slide, logo_file)
 
     # Accent vertical bar
     vbar = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(2.8), Inches(1.2), Inches(0.06), Inches(5.8))
@@ -295,9 +306,9 @@ def build_slide(customer_name: str, accent_rgb, sections: dict, logo_bytes=None)
         ("Critical\nCapabilities", "Critical Capabilities", ["• " + s for s in sections["critical_capabilities"]]),
     ]
     for rail, title, body in rows:
-        _left_label(slide, rail, y - 0.05)
-        _right_title_body(slide, title, body, y - 0.02)
-        _add_rule(slide, y + row_h, rule_color)
+        left_label(slide, rail, y - 0.05)
+        right_title_body(slide, title, body, y - 0.02)
+        add_rule(slide, y + row_h, rule_color)
         y += row_h
 
     # Footer
@@ -313,9 +324,8 @@ def build_slide(customer_name: str, accent_rgb, sections: dict, logo_bytes=None)
 # ---------------------------- Generate ----------------------------
 if st.button("Generate PPTX"):
     try:
-        accent_rgb = _rgb_hex_to_tuple(accent)
         sections = generate_sections(customer.strip(), provider, api_key.strip())
-        prs = build_slide(customer.strip(), accent_rgb, sections, logo)
+        prs = build_slide(customer.strip(), rgb_hex_to_tuple(accent_hex), sections, logo_file)
         buf = io.BytesIO()
         prs.save(buf); buf.seek(0)
         st.success("PPTX generated successfully!")
@@ -328,4 +338,7 @@ if st.button("Generate PPTX"):
     except Exception as e:
         st.error(f"Generation failed: {e}")
 
-st.caption("Tip: If you see a 'missing packages' error, add those names to requirements.txt in your app workspace.")
+st.caption(
+    "If you see a 'Missing dependency' message above, add the package(s) to requirements.txt "
+    "or your environment, then reload the app."
+)
